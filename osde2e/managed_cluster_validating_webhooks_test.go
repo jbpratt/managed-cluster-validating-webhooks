@@ -5,6 +5,7 @@ package osde2etests
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,22 +16,18 @@ import (
 	quotav1 "github.com/openshift/api/quota/v1"
 	securityv1 "github.com/openshift/api/security/v1"
 	"github.com/openshift/osde2e-common/pkg/clients/openshift"
-	"github.com/openshift/osde2e/pkg/common/expect"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	labels "k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/kubectl/pkg/util/slice"
-	"sigs.k8s.io/controller-runtime/pkg/client/config"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -40,12 +37,10 @@ import (
 
 var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 	var (
-		k8sClient          *openshift.Client
+		client             *openshift.Client
 		dedicatedAdmink8s  *openshift.Client
 		userk8s            *openshift.Client
 		clusterAdmink8s    *openshift.Client
-		err                error
-		client             *resources.Resources
 		unauthenticatedk8s *openshift.Client
 		dynamicClient      dynamic.Interface
 	)
@@ -59,47 +54,46 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 	)
 
 	BeforeAll(func() {
-		log.SetLogger(GinkgoLogr)
 		var err error
-		k8sClient, err = openshift.New(GinkgoLogr)
+		client, err = openshift.New(GinkgoLogr)
 		Expect(err).ShouldNot(HaveOccurred(), "Unable to setup k8s client")
-		cfg, err := config.GetConfig()
-		Expect(err).Should(BeNil(), "Unable to get kubeconfig")
-		client, err = resources.New(cfg)
-		Expect(err).Should(BeNil(), "Unable to setup resources")
 
-		dedicatedAdmink8s, err = k8sClient.Impersonate("test-user@redhat.com", "dedicated-admins")
+		dedicatedAdmink8s, err = client.Impersonate("test-user@redhat.com", "dedicated-admins")
 		Expect(err).ShouldNot(HaveOccurred(), "Unable to setup impersonated dedicated admin client")
-		clusterAdmink8s, err = k8sClient.Impersonate("system:admin", "cluster-admins")
+
+		clusterAdmink8s, err = client.Impersonate("system:admin", "cluster-admins")
 		Expect(err).ShouldNot(HaveOccurred(), "Unable to setup impersonated cluster admin client")
-		userk8s, err = k8sClient.Impersonate("majora", "system:authenticated")
+
+		userk8s, err = client.Impersonate("majora", "system:authenticated")
 		Expect(err).ShouldNot(HaveOccurred(), "Unable to setup impersonated user client")
-		unauthenticatedk8s, err = k8sClient.Impersonate("system:unauthenticated")
+
+		unauthenticatedk8s, err = client.Impersonate("system:unauthenticated")
 		Expect(err).ShouldNot(HaveOccurred(), "Unable to setup impersonated unauthenticated user client")
-		dynamicClient, err = dynamic.NewForConfig(cfg)
+
+		dynamicClient, err = dynamic.NewForConfig(client.GetConfig())
 		Expect(err).ShouldNot(HaveOccurred(), "Unable to create dynamic client")
 	})
 
 	It("exists and is running", func(ctx context.Context) {
 		By("checking the namespace exists")
-		err := client.Get(ctx, namespaceName, namespaceName, &v1.Namespace{})
+		err := client.Get(ctx, namespaceName, namespaceName, &corev1.Namespace{})
 		Expect(err).ToNot(HaveOccurred())
 
 		By("checking the configmaps exist")
-		err = client.Get(ctx, configMapName, namespaceName, &v1.ConfigMap{})
+		err = client.Get(ctx, configMapName, namespaceName, &corev1.ConfigMap{})
 		Expect(err).ToNot(HaveOccurred())
 
 		By("checking the secret exists")
-		err = client.Get(ctx, secretName, namespaceName, &v1.Secret{})
+		err = client.Get(ctx, secretName, namespaceName, &corev1.Secret{})
 		Expect(err).ToNot(HaveOccurred())
 
 		By("checking the service exists")
-		err = client.Get(ctx, serviceName, namespaceName, &v1.Service{})
+		err = client.Get(ctx, serviceName, namespaceName, &corev1.Service{})
 		Expect(err).ToNot(HaveOccurred())
 
 		By("checking the daemonset exists")
 		ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: daemonsetName, Namespace: namespaceName}}
-		err = wait.For(conditions.New(client).ResourceMatch(ds, func(object k8s.Object) bool {
+		err = wait.For(conditions.New(client.Resources).ResourceMatch(ds, func(object k8s.Object) bool {
 			d := object.(*appsv1.DaemonSet)
 			desiredNumScheduled := d.Status.DesiredNumberScheduled
 			return d.Status.CurrentNumberScheduled == desiredNumScheduled &&
@@ -118,42 +112,38 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 			createPodWaitDuration = 1 * time.Minute
 		)
 
-		var pod *v1.Pod
-		newTestPod := func(name string) *v1.Pod {
-			return &v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: name,
-				},
-				Spec: v1.PodSpec{
-					Containers: []v1.Container{
-						{
-							Name:  "test",
-							Image: "registry.access.redhat.com/ubi8/ubi-minimal",
-						},
-					},
-					Tolerations: []v1.Toleration{
-						{
-							Key:    "node-role.kubernetes.io/master",
-							Value:  "toleration-key-value",
-							Effect: v1.TaintEffectNoSchedule,
-						}, {
-							Key:    "node-role.kubernetes.io/infra",
-							Value:  "toleration-key-value2",
-							Effect: v1.TaintEffectNoSchedule,
-						},
-					},
-				},
-			}
-		}
+		var pod *corev1.Pod
 
-		withNamespace := func(pod *v1.Pod, namespace string) *v1.Pod {
+		withNamespace := func(pod *corev1.Pod, namespace string) *corev1.Pod {
 			pod.SetNamespace(namespace)
 			return pod
 		}
 
 		BeforeAll(func() {
-			name := envconf.RandomName("testpod", 12)
-			pod = newTestPod(name)
+			pod = &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: envconf.RandomName("testpod", 12),
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "test",
+							Image: "registry.access.redhat.com/ubi8/ubi-minimal",
+						},
+					},
+					Tolerations: []corev1.Toleration{
+						{
+							Key:    "node-role.kubernetes.io/master",
+							Value:  "toleration-key-value",
+							Effect: corev1.TaintEffectNoSchedule,
+						}, {
+							Key:    "node-role.kubernetes.io/infra",
+							Value:  "toleration-key-value2",
+							Effect: corev1.TaintEffectNoSchedule,
+						},
+					},
+				},
+			}
 		})
 
 		It("blocks pods scheduled onto master/infra nodes", func(ctx context.Context) {
@@ -168,28 +158,26 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 		}, SpecTimeout(createPodWaitDuration.Seconds()+deletePodWaitDuration.Seconds()))
 
 		It("allows cluster-admin to schedule pods onto master/infra nodes", func(ctx context.Context) {
-			sa := &v1.ServiceAccount{}
-
-			err := k8sClient.Get(ctx, saName, namespaceName, sa)
-
+			sa := &corev1.ServiceAccount{}
+			err := client.Get(ctx, saName, namespaceName, sa)
 			if err == nil {
-				err = k8sClient.Delete(ctx, sa)
+				err = client.Delete(ctx, sa)
 				Expect(err).ToNot(HaveOccurred(), "Failed to delete existing Service Account")
 			}
 
-			sa = &v1.ServiceAccount{
+			sa = &corev1.ServiceAccount{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      saName,
 					Namespace: namespaceName,
 				},
 			}
-			err = k8sClient.Create(ctx, sa)
+			err = client.Create(ctx, sa)
 			Expect(err).ShouldNot(HaveOccurred(), "Unable to create service account")
 
 			pod = withNamespace(pod, privilegedNamespace)
-			err = k8sClient.Create(ctx, pod)
+			err = client.Create(ctx, pod)
 			Expect(err).NotTo(HaveOccurred())
-			err = k8sClient.Delete(ctx, pod)
+			err = client.Delete(ctx, pod)
 			Expect(err).NotTo(HaveOccurred())
 		}, SpecTimeout(createPodWaitDuration.Seconds()+deletePodWaitDuration.Seconds()))
 
@@ -205,13 +193,13 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 				"rbac-permissions-operator":       "openshift-rbac-permissions",
 			}
 
-			var podList v1.PodList
-			expect.NoError(k8sClient.WithNamespace(metav1.NamespaceAll).List(ctx, &podList), "unable to list pods")
+			var podList corev1.PodList
+			Expect(client.WithNamespace(metav1.NamespaceAll).List(ctx, &podList), "unable to list pods").To(Succeed())
 			Expect(len(podList.Items)).To(BeNumerically(">", 0), "found no pods")
 
-			var nodeList v1.NodeList
+			var nodeList corev1.NodeList
 			selectInfraNodes := resources.WithLabelSelector(labels.FormatLabels(map[string]string{"node-role.kubernetes.io": "infra"}))
-			expect.NoError(k8sClient.List(ctx, &nodeList), selectInfraNodes)
+			Expect(client.List(ctx, &nodeList), selectInfraNodes).To(Succeed())
 
 			nodeNames := []string{}
 			for _, node := range nodeList.Items {
@@ -225,7 +213,7 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 						continue
 					}
 					if strings.HasPrefix(pod.GetName(), operator) && !strings.HasPrefix(pod.GetName(), operator+"-registry") {
-						if !slice.ContainsString(nodeNames, pod.Spec.NodeName, nil) {
+						if !slices.Contains(nodeNames, pod.Spec.NodeName) {
 							violators = append(violators, pod.GetNamespace()+"/"+pod.GetName())
 						}
 					}
@@ -257,7 +245,7 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 		DescribeTable(
 			"allows privileged users to manage \"managed\" resources",
 			func(ctx context.Context, user string) {
-				userk8s, err := k8sClient.Impersonate(user)
+				userk8s, err := client.Impersonate(user)
 				cvo := &configv1.ClusterVersion{ObjectMeta: metav1.ObjectMeta{Name: "osde2e-version"}}
 				err = userk8s.Create(ctx, cvo)
 				Expect(err).NotTo(HaveOccurred())
@@ -287,7 +275,7 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 		It("blocks modifications to nodes", func(ctx context.Context) {
 			var nodes v1.NodeList
 			selectInfraNodes := resources.WithLabelSelector(labels.FormatLabels(map[string]string{"node-role.kubernetes.io": "infra"}))
-			err = dedicatedAdmink8s.List(ctx, &nodes, selectInfraNodes)
+			err := dedicatedAdmink8s.List(ctx, &nodes, selectInfraNodes)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(nodes.Items)).Should(BeNumerically(">", 0), "failed to find infra nodes")
 
@@ -301,6 +289,7 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 		// TODO: test "system:serviceaccounts:openshift-backplane-cee" group can use NetNamespace CR
 
 		It("allows dedicated-admin to manage CustomDomain CRs", func(ctx context.Context) {
+			var err error
 			dynamicClient, err = dynamic.NewForConfig(dedicatedAdmink8s.GetConfig())
 			Expect(err).ShouldNot(HaveOccurred(), "failed creating the dynamic client: %w", err)
 
@@ -326,7 +315,7 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 		})
 
 		It("allows backplane-cluster-admin to manage MustGather CRs", func(ctx context.Context) {
-			backplanecadmin, err := k8sClient.Impersonate("backplane-cluster-admin", "system:serviceaccounts:backplane-cluster-admin")
+			backplanecadmin, err := client.Impersonate("backplane-cluster-admin", "system:serviceaccounts:backplane-cluster-admin")
 			Expect(err).ShouldNot(HaveOccurred(), "Unable to setup impersonated backplane-cluster-admin client")
 			dynamicClient, err = dynamic.NewForConfig(backplanecadmin.GetConfig())
 			Expect(err).ShouldNot(HaveOccurred(), "failed creating the dynamic client: %w", err)
@@ -374,7 +363,7 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 
 		BeforeAll(func(ctx context.Context) {
 			managedCRQ = newTestCRQ("managed" + quotaName)
-			err = clusterAdmink8s.Create(ctx, managedCRQ)
+			err := clusterAdmink8s.Create(ctx, managedCRQ)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create managed ClusterResourceQuota")
 		})
 
@@ -384,14 +373,14 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 		})
 
 		It("blocks deletion of managed ClusterResourceQuotas", func(ctx context.Context) {
-			err = dedicatedAdmink8s.Delete(ctx, managedCRQ)
+			err := dedicatedAdmink8s.Delete(ctx, managedCRQ)
 			Expect(errors.IsForbidden(err)).To(BeTrue(), "Expected deletion to be forbidden for dedicatedAdmink8s")
 			err = userk8s.Delete(ctx, managedCRQ)
-			Expect(errors.IsForbidden(err)).To(BeTrue(), "Expected deletion to be forbidden for k8sClient")
+			Expect(errors.IsForbidden(err)).To(BeTrue(), "Expected deletion to be forbidden for client")
 		})
 
 		It("allows a member of SRE to update managed ClusterResourceQuotas", func(ctx context.Context) {
-			userk8s, err := k8sClient.Impersonate("backplane-cluster-admin")
+			userk8s, err := client.Impersonate("backplane-cluster-admin")
 			managedCRQ.SetLabels(map[string]string{"osde2e": ""})
 			err = userk8s.Update(ctx, managedCRQ)
 			Expect(err).NotTo(HaveOccurred())
@@ -401,14 +390,14 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 			unmanagedCRQ := newTestCRQ("openshift" + quotaName)
 
 			err := dedicatedAdmink8s.Create(ctx, unmanagedCRQ)
-			expect.NoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			unmanagedCRQ.SetLabels(map[string]string{"osde2e": ""})
 			err = dedicatedAdmink8s.Update(ctx, unmanagedCRQ)
-			expect.NoError(err)
+			Expect(err).NotTo(HaveOccurred())
 
 			err = dedicatedAdmink8s.Delete(ctx, unmanagedCRQ)
-			expect.NoError(err)
+			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 
@@ -417,7 +406,7 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 			scc := &securityv1.SecurityContextConstraints{ObjectMeta: metav1.ObjectMeta{Name: "privileged"}}
 			scc.SetLabels(map[string]string{"osde2e": ""})
 
-			err = dedicatedAdmink8s.Update(ctx, scc)
+			err := dedicatedAdmink8s.Update(ctx, scc)
 			Expect(errors.IsForbidden(err)).To(BeTrue())
 
 			err = dedicatedAdmink8s.Delete(ctx, scc)
@@ -466,7 +455,7 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 		}
 
 		updateNamespace := func(ctx context.Context, name string, user string, groups ...string) error {
-			userk8s, err := k8sClient.Impersonate(user, groups...)
+			userk8s, err := client.Impersonate(user, groups...)
 			if err != nil {
 				return err
 			}
@@ -500,14 +489,14 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 		It("blocks dedicated admins from managing privileged namespaces", func(ctx context.Context) {
 			for namespace := range privilegedNamespaces {
 				err := updateNamespace(ctx, namespace, testUser, "dedicated-admins")
-				expect.Forbidden(err)
+				Expect(apierrors.IsForbidden(err)).To(BeTrue())
 			}
 		})
 
 		It("block non privileged users from managing privileged namespaces", func(ctx context.Context) {
 			for namespace := range privilegedNamespaces {
 				err := updateNamespace(ctx, namespace, testUser)
-				expect.Forbidden(err)
+				Expect(apierrors.IsForbidden(err)).To(BeTrue())
 			}
 		})
 
@@ -515,17 +504,17 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 			for _, user := range privilegedUsers {
 				for namespace := range privilegedNamespaces {
 					err := updateNamespace(ctx, namespace, user)
-					expect.NoError(err)
+					Expect(err).NotTo(HaveOccurred())
 				}
 
 				err := updateNamespace(ctx, nonPrivilegedNamespace, user)
-				expect.NoError(err)
+				Expect(err).NotTo(HaveOccurred())
 			}
 		})
 
 		It("allows non privileged users to manage non privileged namespaces", func(ctx context.Context) {
 			err := updateNamespace(ctx, nonPrivilegedNamespace, testUser, "dedicated-admins")
-			expect.NoError(err)
+			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 
@@ -553,10 +542,10 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 		}
 
 		BeforeAll(func(ctx context.Context) {
-			err := monitoringv1.AddToScheme(scheme.Scheme)
+			err := monitoringv1.AddToScheme(client.GetScheme())
 			Expect(err).NotTo(HaveOccurred(), "Failed to add PrometheusRule to scheme")
 			rule := newPrometheusRule(privilegedNamespace)
-			err = k8sClient.Delete(ctx, rule)
+			err = client.Delete(ctx, rule)
 			Expect(err == nil || apierrors.IsNotFound(err)).To(BeTrue(), "Failed to ensure PrometheusRule deletion")
 		})
 
@@ -564,7 +553,7 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 			"blocks users from creating PrometheusRules in privileged namespaces",
 			func(ctx context.Context, user string) {
 				rule := newPrometheusRule(privilegedNamespace)
-				userk8s, err := k8sClient.Impersonate(user, "system:authenticated")
+				userk8s, err := client.Impersonate(user, "system:authenticated")
 
 				err = userk8s.Create(ctx, rule)
 				Expect(err.Error()).To(ContainSubstring("forbidden"))
@@ -574,7 +563,7 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 		)
 
 		It("allows backplane-cluster-admin to manage PrometheusRules in all namespaces", func(ctx context.Context) {
-			backplanecadmin, err := k8sClient.Impersonate("backplane-cluster-admin")
+			backplanecadmin, err := client.Impersonate("backplane-cluster-admin")
 			Expect(err).NotTo(HaveOccurred())
 
 			rule := newPrometheusRule(privilegedNamespace)
@@ -593,7 +582,7 @@ var _ = Describe("Managed Cluster Validating Webhooks", Ordered, func() {
 		It("allows non-privileged users to manage PrometheusRules in non-privileged namespaces", func(ctx context.Context) {
 			rule := newPrometheusRule(namespaceName)
 
-			err = dedicatedAdmink8s.Create(ctx, rule)
+			err := dedicatedAdmink8s.Create(ctx, rule)
 			Expect(err).NotTo(HaveOccurred())
 
 			err = dedicatedAdmink8s.Delete(ctx, rule)
